@@ -1,1 +1,204 @@
-TRALALELO TRALALA
+#!/bin/bash
+
+# Конфигурация
+PROCESS_DIR="/tmp/consensus_processes"
+mkdir -p "$PROCESS_DIR"
+VALUE_FILE="$PROCESS_DIR/value"
+LEADER_FILE="$PROCESS_DIR/leader"
+ALIVE_DIR="$PROCESS_DIR/alive"
+MESSAGES_DIR="$PROCESS_DIR/messages"
+mkdir -p "$ALIVE_DIR" "$MESSAGES_DIR"
+
+# Параметры процесса
+PID=$$
+echo "$PID" > "$ALIVE_DIR/$PID"
+INITIAL_VALUE=0
+READ_ONLY=false
+
+# Инициализация значения, если еще не существует
+if [ ! -f "$VALUE_FILE" ]; then
+    echo "$INITIAL_VALUE" > "$VALUE_FILE"
+fi
+
+# Функция для получения текущего значения
+get_value() {
+    cat "$VALUE_FILE"
+}
+
+# Функция для установки нового значения (только лидером)
+set_value() {
+    if [ "$READ_ONLY" = true ]; then
+        echo "Ошибка: система в режиме read-only"
+        return 1
+    fi
+    
+    if [ ! -f "$LEADER_FILE" ] || [ "$(cat "$LEADER_FILE")" != "$PID" ]; then
+        echo "Ошибка: только лидер может изменять значение"
+        return 1
+    fi
+    
+    echo "$1" > "$VALUE_FILE"
+    echo "Значение обновлено на $1"
+}
+
+# Функция для проверки живых процессов
+check_alive_processes() {
+    local count=0
+    for f in "$ALIVE_DIR"/*; do
+        if [ -f "$f" ]; then
+            local p=$(cat "$f")
+            if ps -p "$p" > /dev/null; then
+                ((count++))
+            else
+                rm -f "$f"
+            fi
+        fi
+    done
+    echo "$count"
+}
+
+# Функция для выбора лидера
+elect_leader() {
+    local alive_count=$(check_alive_processes)
+    if [ "$alive_count" -lt 2 ]; then
+        READ_ONLY=true
+        echo "Предупреждение: недостаточно процессов для выбора лидера. Режим read-only."
+        return
+    fi
+    
+    # Простой алгоритм выбора лидера - процесс с наименьшим PID
+    local min_pid=$PID
+    for f in "$ALIVE_DIR"/*; do
+        if [ -f "$f" ]; then
+            local p=$(cat "$f")
+            if ps -p "$p" > /dev/null && [ "$p" -lt "$min_pid" ]; then
+                min_pid=$p
+            fi
+        fi
+    done
+    
+    echo "$min_pid" > "$LEADER_FILE"
+    if [ "$min_pid" = "$PID" ]; then
+        echo "Я новый лидер (PID: $PID)"
+    else
+        echo "Новый лидер: $min_pid"
+    fi
+}
+
+# Функция для проверки лидера
+check_leader() {
+    if [ ! -f "$LEADER_FILE" ]; then
+        elect_leader
+        return
+    fi
+    
+    local leader=$(cat "$LEADER_FILE")
+    if ! ps -p "$leader" > /dev/null; then
+        echo "Лидер $leader умер. Начинаем новые выборы..."
+        elect_leader
+    fi
+}
+
+# Функция для отправки сообщения
+send_message() {
+    local target_pid=$1
+    local msg=$2
+    echo "$msg" > "$MESSAGES_DIR/$target_pid"
+}
+
+# Функция для проверки сообщений
+check_messages() {
+    local msg_file="$MESSAGES_DIR/$PID"
+    if [ -f "$msg_file" ]; then
+        local msg=$(cat "$msg_file")
+        rm -f "$msg_file"
+        echo "$msg"
+    fi
+}
+
+# Основной цикл процесса
+while true; do
+    # Проверяем состояние системы
+    check_leader
+    
+    # Проверяем сообщения
+    local msg=$(check_messages)
+    if [ -n "$msg" ]; then
+        if [[ "$msg" =~ ^SET: ]]; then
+            # Сообщение на обновление значения
+            if [ "$(cat "$LEADER_FILE")" = "$PID" ]; then
+                new_value=${msg#SET:}
+                set_value "$new_value"
+            else
+                echo "Ошибка: только лидер может изменять значение"
+            fi
+        fi
+    fi
+    
+    # Проверяем количество живых процессов
+    local alive_count=$(check_alive_processes)
+    if [ "$alive_count" -lt 3 ]; then
+        READ_ONLY=true
+    fi
+    
+    sleep 5
+done &
+
+# Интерфейс взаимодействия с пользователем
+echo "Процесс консенсуса запущен (PID: $PID)"
+echo "Доступные команды:"
+echo "  get - получить текущее значение"
+echo "  set <value> - установить новое значение (только лидер)"
+echo "  status - показать статус процесса"
+echo "  exit - завершить процесс"
+
+while true; do
+    read -p "> " cmd args
+    
+    case $cmd in
+        get)
+            echo "Текущее значение: $(get_value)"
+            ;;
+        set)
+            if [ "$READ_ONLY" = true ]; then
+                echo "Ошибка: система в режиме read-only"
+                continue
+            fi
+            
+            if [ -z "$args" ]; then
+                echo "Использование: set <value>"
+                continue
+            fi
+            
+            if [ "$(cat "$LEADER_FILE")" = "$PID" ]; then
+                set_value "$args"
+            else
+                # Отправляем сообщение лидеру
+                leader=$(cat "$LEADER_FILE")
+                send_message "$leader" "SET:$args"
+                echo "Запрос на обновление значения отправлен лидеру $leader"
+            fi
+            ;;
+        status)
+            echo "PID: $PID"
+            echo "Текущее значение: $(get_value)"
+            if [ -f "$LEADER_FILE" ]; then
+                echo "Лидер: $(cat "$LEADER_FILE")"
+            else
+                echo "Лидер: не выбран"
+            fi
+            echo "Режим read-only: $READ_ONLY"
+            echo "Живые процессы: $(check_alive_processes)/3"
+            ;;
+        exit)
+            echo "Завершение процесса $PID"
+            rm -f "$ALIVE_DIR/$PID"
+            kill %1  # Завершаем фоновый процесс
+            exit 0
+            ;;
+        *)
+            echo "Неизвестная команда: $cmd"
+            echo "Доступные команды: get, set <value>, status, exit"
+            ;;
+    esac
+done
